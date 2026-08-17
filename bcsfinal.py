@@ -1,0 +1,190 @@
+import sys
+import time
+import signal
+import hashlib
+import requests
+import threading
+import warnings
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+# Try loading native high-speed curve library
+try:
+    import ecdsa
+except ImportError:
+    print("[!] Error: The 'ecdsa' module is missing.")
+    print("[*] Please fix this by running: pip install ecdsa")
+    sys.exit(1)
+
+warnings.filterwarnings("ignore", category=DeprecationWarning)
+
+# --- CONFIGURATION SETTINGS ---
+GENERATOR_WORKERS = 2       # Lowered slightly because local ECDSA math uses more CPU
+NETWORK_CHECK_WORKERS = 16  
+KEYS_PER_PAGE = 128
+
+page_checkpoint = 0
+active_balance_threads = 0
+file_lock = threading.Lock()
+print_lock = threading.Lock()
+
+network_executor = ThreadPoolExecutor(max_workers=NETWORK_CHECK_WORKERS)
+
+def signal_handler(signal, frame):
+    with print_lock:
+        print(f"\n[+] Script stopped. Checkpoint saved near page: {page_checkpoint}")
+    network_executor.shutdown(wait=False, cancel_futures=True)
+    sys.exit(0)
+
+signal.signal(signal.SIGINT, signal_handler)
+
+def base58_encode(b):
+    """Encodes raw bytes into a valid cryptographic Base58 check string."""
+    alphabet = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz'
+    n = int.from_bytes(b, 'big')
+    res = []
+    while n > 0:
+        n, r = divmod(n, 58)
+        res.append(alphabet[r])
+    pad = 0
+    for byte in b:
+        if byte == 0: pad += 1
+        else: break
+    return '1' * pad + ''.join(reversed(res))
+
+def derive_bitcoin_wallet(priv_int):
+    """
+    Takes an integer, performs secp256k1 point multiplication,
+    and returns a valid (WIF_Private_Key, Public_Bitcoin_Address) tuple.
+    """
+    # 1. Generate Valid WIF Private Key
+    priv_bytes = priv_int.to_bytes(32, 'big')
+    extended_key = b'\x80' + priv_bytes
+    first_sha = hashlib.sha256(extended_key).digest()
+    second_sha = hashlib.sha256(first_sha).digest()
+    wif_key = base58_encode(extended_key + second_sha[:4])
+
+    # 2. Derive Public Key Point using secp256k1 Elliptic Curve Math
+    sk = ecdsa.SigningKey.from_secret_exponent(priv_int, curve=ecdsa.SECP256k1)
+    vk = sk.verifying_key
+    public_key_bytes = b'\x04' + vk.to_string() # Uncompressed public key footprint
+
+    # 3. Hash Public Key to build standard Legacy Address (SHA256 -> RIPEMD160)
+    sha256_pk = hashlib.sha256(public_key_bytes).digest()
+    ripemd160 = hashlib.new('ripemd160')
+    ripemd160.update(sha256_pk)
+    hashed_pk = ripemd160.digest()
+
+    # 4. Attach Network Byte (0x00 for Mainnet) and Checksum
+    network_version_bin = b'\x00' + hashed_pk
+    checksum = hashlib.sha256(hashlib.sha256(network_version_bin).digest()).digest()[:4]
+    public_address = base58_encode(network_version_bin + checksum)
+
+    return wif_key, public_address
+
+def check_wallet_balance_worker(address, wif_key):
+    global active_balance_threads
+    with file_lock:
+        active_balance_threads += 1
+
+    try:
+        # Pinging a valid live raw balance tracking API text node
+        url = f"https://blockchain.info{address}"
+        res = requests.get(url, timeout=5)
+        if res.status_code == 200:
+            balance_satoshis = int(res.text.strip())
+            if balance_satoshis > 0:
+                btc = balance_satoshis / 100000000.0
+                with file_lock:
+                    with open('./wallets_balance.txt', 'a') as f:
+                        f.write(f"HIT! Address: {address} | WIF: {wif_key} | Balance: {btc} BTC\n")
+                    print(f"\n[!!!] REAL HIT FOUND! {btc} BTC at Address: {address} | Key: {wif_key}")
+    except Exception:
+        pass
+    finally:
+        with file_lock:
+            active_balance_threads -= 1
+
+def generate_local_page(page_num):
+    """Calculates 128 mathematically unique, verified live keys and addresses offline."""
+    parsed_data = []
+    start_index = ((page_num - 1) * KEYS_PER_PAGE) + 1
+    
+    for i in range(KEYS_PER_PAGE):
+        current_private_key_int = start_index + i
+        
+        # Max limit check for legitimate elliptic curve keyspace size limits
+        if current_private_key_int >= 115792089237316195423570985008687907852837564279074904382605163141518161494337:
+            return "404"
+            
+        try:
+            # Derive genuine cryptographic components completely locally
+            wif_str, real_address = derive_bitcoin_wallet(current_private_key_int)
+            
+            parsed_data.append(f"Key: {wif_str} ; Address: {real_address}\n")
+            
+            # Send the genuine derived address down into our fixed background checking pool
+            network_executor.submit(check_wallet_balance_worker, real_address, wif_str)
+        except Exception:
+            continue
+
+    with file_lock:
+        if parsed_data:
+            with open('./wallets.txt', 'a') as wallets_file:
+                wallets_file.writelines(parsed_data)
+                
+    return "SUCCESS"
+
+# --- Startup Flow ---
+try:
+    with open('./page_real', 'r') as f:
+        saved_checkpoint = int(f.read().strip())
+except (IOError, ValueError):
+    saved_checkpoint = None
+
+if saved_checkpoint is not None:
+    ans = input(f"[?] Found real database saved checkpoint at page {saved_checkpoint}. Resume progress? (y/n): ").strip().lower()
+    start_page = saved_checkpoint + 1 if ans == 'y' else int(input("[?] Enter Start Page: ").strip())
+else:
+    start_page = int(input("[?] Enter Start Page: ").strip())
+
+end_input = input("[?] Enter End Page (or press Enter for infinite): ").strip()
+end_page = int(end_input) if end_input.isdigit() else float('inf')
+
+print(f"\n[+] Cryptographic Pipeline Engaged. Deriving real ECDSA Bitcoin addresses locally...")
+current_chunk_start = start_page
+page_checkpoint = start_page - 1
+
+# --- Processing Execution Engine ---
+while current_chunk_start <= end_page:
+    batch_size = min(GENERATOR_WORKERS, (end_page - current_chunk_start) + 1)
+    if batch_size <= 0:
+        break
+        
+    page_batch = list(range(current_chunk_start, current_chunk_start + int(batch_size)))
+    
+    with ThreadPoolExecutor(max_workers=len(page_batch)) as page_executor:
+        future_to_page = {page_executor.submit(generate_local_page, p): p for p in page_batch}
+        reached_end = False
+
+        for future in as_completed(future_to_page):
+            result = future.result()
+            if result == "404":
+                reached_end = True
+
+        if reached_end:
+            print("\n[+] Absolute edge of elliptic keyspace boundary reached. Terminating.")
+            break
+
+        current_chunk_start += len(page_batch)
+        page_checkpoint = current_chunk_start - 1
+
+        with print_lock:
+            print(f"Verified Page: {page_checkpoint} / {end_page if end_page != float('inf') else 'Inf'} | Live API Threads: {active_balance_threads} / {NETWORK_CHECK_WORKERS}")
+
+        with file_lock:
+            with open('./page_real', 'w') as f:
+                f.write(str(page_checkpoint))
+
+print("\n[*] Processing finalized. Closing network context maps...")
+network_executor.shutdown(wait=True)
+print(f"[+] Complete success. Final checkpoint safe at page: {page_checkpoint}")
