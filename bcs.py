@@ -7,7 +7,8 @@ import cssutils
 import threading
 
 from cssutils import css
-from BeautifulSoup import BeautifulSoup
+from bs4 import BeautifulSoup
+
 
 
 def signal_handler(signal, frame):
