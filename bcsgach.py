@@ -39,8 +39,8 @@ HISTORIC_RANGES = {
 }
 
 # --- ENGINE CONFIGURATION ---
-GENERATOR_WORKERS = 2       # Lowered to 2 because generating 3 addresses per key uses more CPU
-NETWORK_CHECK_WORKERS = 30  # Increased ceiling to handle the tripled volume of network queries
+GENERATOR_WORKERS = 2       
+NETWORK_CHECK_WORKERS = 30  
 KEYS_PER_PAGE = 128
 
 # Tracking Metrics
@@ -93,7 +93,7 @@ def bech32_hrp_expand(hrp):
 
 def encode_bech32(hrp, data):
     """Encodes raw witness data bits into standard Native SegWit Bech32 strings."""
-    combined = data + [0, 0, 0, 0, 0, 0]
+    combined = data
     polymod = bech32_polymod(bech32_hrp_expand(hrp) + combined) ^ 1
     checksum = [(polymod >> (5 * (5 - i))) & 31 for i in range(6)]
     charset = "qpzry9x8gf2tvdw0s3jn54khce6mua7l"
@@ -121,26 +121,19 @@ def convert_bits(data, from_bits, to_bits, pad=True):
     return ret
 
 def derive_bitcoin_addresses(priv_int):
-    """
-    Takes a private key integer and computes 3 distinct standard public address formats:
-    1. Legacy Uncompressed (1...)
-    2. Legacy Compressed (1...) -> Satoshi style
-    3. Native SegWit Bech32 (bc1q...)
-    """
-    # Generate WIF Private Key
+    """Computes 3 distinct public address formats from a single key seed integer."""
     priv_bytes = priv_int.to_bytes(32, 'big')
     extended_key = b'\x80' + priv_bytes
     first_sha = hashlib.sha256(extended_key).digest()
     second_sha = hashlib.sha256(first_sha).digest()
     wif_key = base58_encode(extended_key + second_sha[:4])
 
-    # Derive public coordinates using secp256k1 Curve Math
     sk = ecdsa.SigningKey.from_secret_exponent(priv_int, curve=ecdsa.SECP256k1)
     vk = sk.verifying_key
     pub_x = vk.pubkey.point.x().to_bytes(32, 'big')
     pub_y = vk.pubkey.point.y().to_bytes(32, 'big')
 
-    # --- FORMAT 1: Legacy Uncompressed Address ---
+    # 1. Legacy Uncompressed Address
     pub_uncompressed = b'\x04' + pub_x + pub_y
     sha_uncomp = hashlib.sha256(pub_uncompressed).digest()
     rmd_uncomp = hashlib.new('ripemd160', sha_uncomp).digest()
@@ -148,7 +141,7 @@ def derive_bitcoin_addresses(priv_int):
     chk_uncomp = hashlib.sha256(hashlib.sha256(net_uncomp).digest()).digest()[:4]
     legacy_uncompressed = base58_encode(net_uncomp + chk_uncomp)
 
-    # --- FORMAT 2: Legacy Compressed Address (Satoshi standard mapping) ---
+    # 2. Legacy Compressed Address
     prefix = b'\x02' if vk.pubkey.point.y() % 2 == 0 else b'\x03'
     pub_compressed = prefix + pub_x
     sha_comp = hashlib.sha256(pub_compressed).digest()
@@ -157,16 +150,15 @@ def derive_bitcoin_addresses(priv_int):
     chk_comp = hashlib.sha256(hashlib.sha256(net_comp).digest()).digest()[:4]
     legacy_compressed = base58_encode(net_comp + chk_comp)
 
-    # --- FORMAT 3: Native SegWit Bech32 Address (bc1q...) ---
-    # Witness program version 0 for native SegWit uses the ripemd160 footprint of the compressed pubkey
+    # 3. Native SegWit Bech32 Address (bc1q...)
     witness_program = rmd_comp
     converted = convert_bits(witness_program, 8, 5, True)
-    bech32_address = encode_bech32("bc1", [0] + converted) # 0 is witness version 0
+    # Native SegWit v0 uses a [0] (witness version) prefix inside the address payload data
+    bech32_address = encode_bech32("bc1", [0] + converted)
 
     return wif_key, legacy_uncompressed, legacy_compressed, bech32_address
 
 def check_wallet_balance_worker(address, wif_key, block_name, addr_type):
-    """Pings public infrastructure to verify active balance states."""
     global active_balance_threads
     with file_lock:
         active_balance_threads += 1
@@ -178,8 +170,6 @@ def check_wallet_balance_worker(address, wif_key, block_name, addr_type):
             balance_satoshis = int(res.text.strip())
             if balance_satoshis > 0:
                 btc = balance_satoshis / 100000000.0
-                
-                # CRITICAL SEPARATION LOCK: Triggers disk storage write ONLY on accurate active hits
                 with file_lock:
                     with open('./FOUND_BALANCES.txt', 'a') as f:
                         f.write(f"HIT! Range: {block_name} | Type: {addr_type} | Address: {address} | WIF: {wif_key} | Balance: {btc} BTC\n")
@@ -192,7 +182,6 @@ def check_wallet_balance_worker(address, wif_key, block_name, addr_type):
             active_balance_threads -= 1
 
 def generate_local_page(page_num, block_name):
-    """Calculates 128 unique keys, generating 3 target verification tracks per key."""
     global total_keys_checked, total_addresses_checked
     start_index = ((page_num - 1) * KEYS_PER_PAGE) + 1
     
@@ -202,14 +191,12 @@ def generate_local_page(page_num, block_name):
             return "404"
             
         try:
-            # Generate the trio of distinct layouts inside transient memory arrays
             wif_str, addr_uncomp, addr_comp, addr_segwit = derive_bitcoin_addresses(current_private_key_int)
             
             with file_lock:
                 total_keys_checked += 1
                 total_addresses_checked += 3
             
-            # Pipe all three variants to the concurrent network execution worker block
             network_executor.submit(check_wallet_balance_worker, addr_uncomp, wif_str, block_name, "Legacy Uncompressed")
             network_executor.submit(check_wallet_balance_worker, addr_comp, wif_str, block_name, "Legacy Compressed")
             network_executor.submit(check_wallet_balance_worker, addr_segwit, wif_str, block_name, "Native SegWit")
@@ -250,3 +237,23 @@ for idx, details in HISTORIC_RANGES.items():
     print(f"    Note:  {details['desc']}\n")
 
 print(" A) Scan ALL Historical Blocks (Automated Range-Hopping Mode)")
+print("="*60)
+
+choice = input("[?] Enter selection (1, 2, 3, or A): ").strip().upper()
+
+print(f"\n[+] Zero-Storage Multi-Format Memory Pipeline Engaged.")
+print(f"[+] Sweeping Uncompressed, Compressed, and SegWit configurations in RAM.\n")
+
+if choice == 'A':
+    print("[*] Starting Automated Range-Hopper across all targets...")
+    for idx, details in HISTORIC_RANGES.items():
+        print(f"\n[*] Jumping directly into target range block: {details['name']}")
+        run_range_scanner(details['start'], details['end'], details['name'])
+else:
+    target = HISTORIC_RANGES.get(choice)
+    if target:
+        print(f"[*] Locking sequence onto specific block: {target['name']}")
+        run_range_scanner(target['start'], target['end'], target['name'])
+    else:
+        print("[!] Invalid selection. Defaulting to Option 1.")
+        run_range_scanner(HISTORIC_RANGES["1"]['start'], HISTORIC_RANGES["1"]['end'], HISTORIC_RANGES["1"]['name'])
