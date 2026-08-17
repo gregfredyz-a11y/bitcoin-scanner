@@ -161,6 +161,7 @@ def derive_bitcoin_addresses(priv_int):
     # 3. Native SegWit Bech32 Address (bc1q...)
     witness_program = rmd_comp
     converted = convert_bits(witness_program, 8, 5, True)
+    # FIX: Removed the extra plus sign here
     bech32_address = encode_bech32("bc1", converted)
 
     return wif_key, legacy_uncompressed, legacy_compressed, bech32_address
@@ -170,11 +171,9 @@ def check_wallet_balance_worker(address, wif_key, block_name, addr_type):
     with file_lock:
         active_balance_threads += 1
 
-    # Reverted to a single fast endpoint because secondary mirrors drop connections too frequently
     url = f"https://blockchain.info{address}"
 
     try:
-        # Reduced timeout window to clear the queue fast
         res = requests.get(url, timeout=2.5)
         if res.status_code == 200:
             raw_text = res.text.strip()
@@ -224,7 +223,6 @@ def generate_local_page(page_num, block_name):
 def run_range_scanner(start, end, block_name):
     current_chunk_start = start
     while current_chunk_start <= end:
-        # Tight scheduling guard
         while active_balance_threads >= NETWORK_CHECK_WORKERS - 1:
             time.sleep(0.2)
 
@@ -261,3 +259,4 @@ print("="*60)
 
 choice = input("[?] Enter selection (1, 2, 3, or A): ").strip().upper()
 
+print(f"\n[+] Zero-Storage Multi-Format Memory Pipeline Engaged.")
