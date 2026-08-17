@@ -13,9 +13,10 @@ from requests.adapters import HTTPAdapter
 
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 
-# --- BALANCED PERFORMANCE CONFIGURATION ---
-MAX_WORKERS = 3          # Kept tight to prevent local IP bans
-DELAY_BETWEEN_PAGES = 0.8 # Added breathing room to blend with human traffic parameters
+# --- CONFIGURATION ---
+MAX_WORKERS = 3          
+DELAY_BETWEEN_PAGES = 0.8 
+MAX_RETRIES_PER_BLOCK = 2  # Breaks the infinite loop if the site goes down
 
 class TLSAdapter(HTTPAdapter):
     def init_poolmanager(self, *args, **kwargs):
@@ -30,7 +31,6 @@ adapter = TLSAdapter(pool_connections=MAX_WORKERS * 2, pool_maxsize=MAX_WORKERS 
 session.mount('https://', adapter)
 session.mount('http://', adapter)
 
-# Rotating user agents to bypass basic signatures
 USER_AGENTS = [
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
     'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
@@ -45,7 +45,7 @@ page_checkpoint = 0
 end_page = float('inf')  
 active_balance_threads = 0
 PROXY_POOL = []
-USE_PROXIES = False # Set to True if you want to force try public proxies again
+USE_PROXIES = False 
 
 def signal_handler(signal, frame):
     with print_lock:
@@ -63,7 +63,6 @@ def fetch_live_proxies():
         "https://proxyscrape.com"
     ]
     found_proxies = []
-    
     for url in urls:
         try:
             res = requests.get(url, timeout=6)
@@ -75,7 +74,6 @@ def fetch_live_proxies():
                         found_proxies.append(proxy)
         except Exception:
             pass
-
     with proxy_lock:
         PROXY_POOL = list(set(found_proxies))
         print(f"[+] Loaded {len(PROXY_POOL)} rotating proxies into tracking pool.")
@@ -101,7 +99,6 @@ def check_wallet_balance(wallet_url):
     global active_balance_threads
     with file_lock:
         active_balance_threads += 1
-
     proxy = get_random_proxy()
     headers = {'User-Agent': random.choice(USER_AGENTS)}
     try:
@@ -128,16 +125,13 @@ def process_single_page(page_num):
         'User-Agent': random.choice(USER_AGENTS),
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
     }
-    
     try:
         req = session.post(url, headers=headers, proxies=proxy, timeout=7)
-        
         if req.status_code == 404:
             return "404"
         if req.status_code != 200:
             drop_bad_proxy(proxy)
             return "RETRY"
-
         soup = BeautifulSoup(req.text, 'html.parser')
         keys = soup.find('pre', {'class': 'keys'})
         if not keys:
@@ -148,17 +142,14 @@ def process_single_page(page_num):
 
         parsed_wallets = []
         balance_urls = []
-
         for wallet in str(keys).split("\n"):
             if not wallet.strip():
                 continue
-
             w_soup = BeautifulSoup(wallet, 'html.parser')
             for plus in w_soup.find_all('a', href=re.compile(r'warning')):
                 plus.decompose()
 
             wallet_key, wallet_rsa, wallet_url = None, None, None
-
             for block in w_soup:
                 if type(block).__name__ == 'NavigableString':
                     wallet_rsa = block.string.strip() if block.string else None
@@ -175,17 +166,14 @@ def process_single_page(page_num):
             if parsed_wallets:
                 with open('./wallets', 'a') as wallets_file:
                     wallets_file.writelines(parsed_wallets)
-            
             for b_url in balance_urls:
                 threading.Thread(target=check_wallet_balance, args=(b_url,), daemon=True).start()
-
         return "SUCCESS"
-
     except Exception:
         drop_bad_proxy(proxy)
         return "RETRY"
 
-# --- Startup Controls ---
+# --- Range Setup ---
 saved_checkpoint = None
 try:
     with open('./page', 'r') as f:
@@ -213,8 +201,9 @@ if proxy_choice == 'y':
 print(f"\n[+] Active Setup: Scanning from page {start_page} to {end_page if end_page != float('inf') else 'Infinity'}")
 current_chunk_start = start_page
 page_checkpoint = start_page - 1
+retry_counter = 0
 
-# --- Main Worker Loop ---
+# --- Main Loop ---
 while current_chunk_start <= end_page:
     if USE_PROXIES and len(PROXY_POOL) < 5 and len(PROXY_POOL) > 0:
         fetch_live_proxies()
@@ -227,7 +216,6 @@ while current_chunk_start <= end_page:
     
     with ThreadPoolExecutor(max_workers=len(page_batch)) as executor:
         future_to_page = {executor.submit(process_single_page, p): p for p in page_batch}
-        
         failed_pages = []
         reached_end = False
 
@@ -247,14 +235,21 @@ while current_chunk_start <= end_page:
             break
 
         if failed_pages:
-            current_chunk_start = min(failed_pages)
-            # Introduce variable jitter if we are hitting hard blocks to shed firewalls
-            sleep_time = random.uniform(3.0, 6.0)
-            print(f"\r[*] Block encountered at index {current_chunk_start}. Cooling down for {sleep_time:.1f}s...", end="")
-            time.sleep(sleep_time)
+            retry_counter += 1
+            if retry_counter >= MAX_RETRIES_PER_BLOCK:
+                # BREAK OUT STRATEGY: Site is down or permanently blocking this block. Force skip ahead.
+                print(f"\n[!] Block {page_batch} failed {retry_counter} times consecutively (Server Down). Force skipping block to maintain run velocity...")
+                current_chunk_start += len(page_batch)
+                retry_counter = 0
+            else:
+                current_chunk_start = min(failed_pages)
+                sleep_time = random.uniform(2.0, 4.0)
+                print(f"\n[*] Server error at page {current_chunk_start}. Retrying in {sleep_time:.1f}s... (Attempt {retry_counter}/{MAX_RETRIES_PER_BLOCK})")
+                time.sleep(sleep_time)
         else:
             current_chunk_start += len(page_batch)
-            print(f"\rHighest Verified Page: {current_chunk_start - 1} / {end_page if end_page != float('inf') else 'Inf'} | Balance Threads: {active_balance_threads} | Proxies Active: {len(PROXY_POOL)}", end="")
+            retry_counter = 0
+            print(f"\rHighest Verified Page: {current_chunk_start - 1} / {end_page if end_page != float('inf') else 'Inf'} | Balance Threads: {active_balance_threads} | Proxies: {len(PROXY_POOL)}", end="")
         
         page_checkpoint = current_chunk_start - 1
 
@@ -263,5 +258,5 @@ while current_chunk_start <= end_page:
                 with open('./page', 'w') as f:
                     f.write(str(page_checkpoint))
 
-    time.write_delay = random.uniform(DELAY_BETWEEN_PAGES * 0.5, DELAY_BETWEEN_PAGES * 1.5)
-    time.sleep(time.write_delay)
+    time_delay = random.uniform(DELAY_BETWEEN_PAGES * 0.5, DELAY_BETWEEN_PAGES * 1.5)
+    time.sleep(time_delay)
