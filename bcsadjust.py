@@ -13,9 +13,9 @@ from requests.adapters import HTTPAdapter
 
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 
-# --- CONFIGURATION ---
-MAX_WORKERS = 4          # Kept low for safety when running without proxies
-DELAY_BETWEEN_PAGES = 0.5
+# --- BALANCED PERFORMANCE CONFIGURATION ---
+MAX_WORKERS = 3          # Kept tight to prevent local IP bans
+DELAY_BETWEEN_PAGES = 0.8 # Added breathing room to blend with human traffic parameters
 
 class TLSAdapter(HTTPAdapter):
     def init_poolmanager(self, *args, **kwargs):
@@ -26,15 +26,16 @@ class TLSAdapter(HTTPAdapter):
         return super().init_poolmanager(*args, **kwargs)
 
 session = requests.Session()
-adapter = TLSAdapter(pool_connections=MAX_WORKERS * 3, pool_maxsize=MAX_WORKERS * 3)
+adapter = TLSAdapter(pool_connections=MAX_WORKERS * 2, pool_maxsize=MAX_WORKERS * 2)
 session.mount('https://', adapter)
 session.mount('http://', adapter)
 
-session.headers.update({
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-    'Accept-Language': 'en-US,en;q=0.5'
-})
+# Rotating user agents to bypass basic signatures
+USER_AGENTS = [
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/121.0'
+]
 
 file_lock = threading.Lock()
 print_lock = threading.Lock()
@@ -44,6 +45,7 @@ page_checkpoint = 0
 end_page = float('inf')  
 active_balance_threads = 0
 PROXY_POOL = []
+USE_PROXIES = False # Set to True if you want to force try public proxies again
 
 def signal_handler(signal, frame):
     with print_lock:
@@ -53,25 +55,23 @@ def signal_handler(signal, frame):
 signal.signal(signal.SIGINT, signal_handler)
 
 def fetch_live_proxies():
-    """Scrapes up-to-date active public proxies from expanded fallback sources."""
     global PROXY_POOL
+    if not USE_PROXIES:
+        return
     urls = [
-        "https://githubusercontent.com",
         "https://githubusercontent.com",
         "https://proxyscrape.com"
     ]
     found_proxies = []
-    print("[*] Fetching fresh proxy lists...")
     
     for url in urls:
         try:
-            # Drop proxy parameter here to ensure we fetch the list with local IP
-            res = requests.get(url, timeout=8)
+            res = requests.get(url, timeout=6)
             if res.status_code == 200:
                 lines = res.text.strip().split("\n")
                 for line in lines:
                     proxy = line.strip()
-                    if proxy and (":" in proxy or "." in proxy):
+                    if proxy and ":" in proxy:
                         found_proxies.append(proxy)
         except Exception:
             pass
@@ -81,9 +81,11 @@ def fetch_live_proxies():
         print(f"[+] Loaded {len(PROXY_POOL)} rotating proxies into tracking pool.")
 
 def get_random_proxy():
+    if not USE_PROXIES:
+        return None
     with proxy_lock:
         if not PROXY_POOL:
-            return None  # Fallback to local IP if proxy pool is empty
+            return None
         proxy = random.choice(PROXY_POOL)
         return {"http": f"http://{proxy}", "https": f"http://{proxy}"}
 
@@ -101,8 +103,9 @@ def check_wallet_balance(wallet_url):
         active_balance_threads += 1
 
     proxy = get_random_proxy()
+    headers = {'User-Agent': random.choice(USER_AGENTS)}
     try:
-        subreq = session.get(wallet_url, proxies=proxy, timeout=7)
+        subreq = session.get(wallet_url, headers=headers, proxies=proxy, timeout=6)
         if subreq.status_code == 200:
             balance = BeautifulSoup(subreq.text, 'html.parser').find('td', id='final_balance')
             if balance:
@@ -121,9 +124,13 @@ def check_wallet_balance(wallet_url):
 def process_single_page(page_num):
     url = f'http://directory.io{page_num}'
     proxy = get_random_proxy()
+    headers = {
+        'User-Agent': random.choice(USER_AGENTS),
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+    }
     
     try:
-        req = session.post(url, proxies=proxy, timeout=8)
+        req = session.post(url, headers=headers, proxies=proxy, timeout=7)
         
         if req.status_code == 404:
             return "404"
@@ -134,7 +141,7 @@ def process_single_page(page_num):
         soup = BeautifulSoup(req.text, 'html.parser')
         keys = soup.find('pre', {'class': 'keys'})
         if not keys:
-            return "RETRY"  # If page layout fails, force retry on this page index
+            return "RETRY"
 
         for strong in keys.find_all('strong'):
             strong.decompose()
@@ -178,7 +185,7 @@ def process_single_page(page_num):
         drop_bad_proxy(proxy)
         return "RETRY"
 
-# --- Range Setup ---
+# --- Startup Controls ---
 saved_checkpoint = None
 try:
     with open('./page', 'r') as f:
@@ -190,18 +197,18 @@ if saved_checkpoint is not None:
     ans = input(f"[?] Found saved checkpoint at page {saved_checkpoint}. Resume progress? (y/n): ").strip().lower()
     if ans == 'y':
         start_page = saved_checkpoint + 1
-        end_input = input("[?] Enter End Page (or press Enter for infinite): ").strip()
-        end_page = int(end_input) if end_input.isdigit() else float('inf')
     else:
         start_page = int(input("[?] Enter Start Page: ").strip())
-        end_input = input("[?] Enter End Page (or press Enter for infinite): ").strip()
-        end_page = int(end_input) if end_input.isdigit() else float('inf')
 else:
     start_page = int(input("[?] Enter Start Page: ").strip())
-    end_input = input("[?] Enter End Page (or press Enter for infinite): ").strip()
-    end_page = int(end_input) if end_input.isdigit() else float('inf')
 
-fetch_live_proxies()
+end_input = input("[?] Enter End Page (or press Enter for infinite): ").strip()
+end_page = int(end_input) if end_input.isdigit() else float('inf')
+
+proxy_choice = input("[?] Use free proxy lists? (Can cause loops on failure) (y/n): ").strip().lower()
+if proxy_choice == 'y':
+    USE_PROXIES = True
+    fetch_live_proxies()
 
 print(f"\n[+] Active Setup: Scanning from page {start_page} to {end_page if end_page != float('inf') else 'Infinity'}")
 current_chunk_start = start_page
@@ -209,8 +216,7 @@ page_checkpoint = start_page - 1
 
 # --- Main Worker Loop ---
 while current_chunk_start <= end_page:
-    # Attempt proxy refresh only if we are using proxies and they ran out
-    if len(PROXY_POOL) < 5 and len(PROXY_POOL) > 0:
+    if USE_PROXIES and len(PROXY_POOL) < 5 and len(PROXY_POOL) > 0:
         fetch_live_proxies()
 
     batch_size = min(MAX_WORKERS, (end_page - current_chunk_start) + 1)
@@ -240,22 +246,22 @@ while current_chunk_start <= end_page:
             print("\n[+] Database limit hit (404). Exiting.")
             break
 
-        # CRITICAL PROGRESS FIX: If pages fail, do not skip them! 
         if failed_pages:
             current_chunk_start = min(failed_pages)
-            print(f"\n[*] Page block failed. Retrying from lowest failed index: {current_chunk_start}")
-            time.sleep(2)
+            # Introduce variable jitter if we are hitting hard blocks to shed firewalls
+            sleep_time = random.uniform(3.0, 6.0)
+            print(f"\r[*] Block encountered at index {current_chunk_start}. Cooling down for {sleep_time:.1f}s...", end="")
+            time.sleep(sleep_time)
         else:
             current_chunk_start += len(page_batch)
+            print(f"\rHighest Verified Page: {current_chunk_start - 1} / {end_page if end_page != float('inf') else 'Inf'} | Balance Threads: {active_balance_threads} | Proxies Active: {len(PROXY_POOL)}", end="")
         
         page_checkpoint = current_chunk_start - 1
-
-        with print_lock:
-            print(f"Highest Verified Page: {page_checkpoint} / {end_page if end_page != float('inf') else 'Inf'} | Balance Threads: {active_balance_threads} | Proxies: {len(PROXY_POOL)}")
 
         if not failed_pages:
             with file_lock:
                 with open('./page', 'w') as f:
                     f.write(str(page_checkpoint))
 
-    time.sleep(DELAY_BETWEEN_PAGES)
+    time.write_delay = random.uniform(DELAY_BETWEEN_PAGES * 0.5, DELAY_BETWEEN_PAGES * 1.5)
+    time.sleep(time.write_delay)
